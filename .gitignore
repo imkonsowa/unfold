@@ -1,0 +1,10 @@
+.idea/
+.vscode/
+*.iml
+.env
+bin/
+dist/
+vendor/
+*.test
+coverage.*
+/unfold
