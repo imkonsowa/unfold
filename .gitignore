@@ -8,3 +8,4 @@ vendor/
 *.test
 coverage.*
 /unfold
+/unfold-vet

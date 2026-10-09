@@ -1,156 +1,111 @@
 package main
 
 import (
-	"strings"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
 	"testing"
 )
 
-func TestUnfold(t *testing.T) {
-	t.Parallel()
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
 
-	tests := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{
-			name: "struct literal",
-			in:   "package p\n\nvar v = T{A: 1, B: 2}\n",
-			want: "package p\n\nvar v = T{\n\tA: 1,\n\tB: 2,\n}\n",
-		},
-		{
-			name: "one field",
-			in:   "package p\n\nvar v = T{A: 1}\n",
-			want: "package p\n\nvar v = T{\n\tA: 1,\n}\n",
-		},
-		{
-			name: "map and slice",
-			in:   "package p\n\nvar m = map[string]int{\"a\": 1}\nvar s = []string{\"a\", \"b\"}\n",
-			want: "package p\n\nvar m = map[string]int{\n\t\"a\": 1,\n}\nvar s = []string{\n\t\"a\",\n\t\"b\",\n}\n",
-		},
-		{
-			name: "nested",
-			in:   "package p\n\nvar v = T{A: U{B: 1}}\n",
-			want: "package p\n\nvar v = T{\n\tA: U{\n\t\tB: 1,\n\t},\n}\n",
-		},
-		{
-			name: "struct type",
-			in:   "package p\n\nvar v struct{ Name, Repo string }\n",
-			want: "package p\n\nvar v struct {\n\tName, Repo string\n}\n",
-		},
-		{
-			name: "function literal",
-			in:   "package p\n\nfunc f() {\n\tdefer func() { _ = g() }()\n}\n",
-			want: "package p\n\nfunc f() {\n\tdefer func() {\n\t\t_ = g()\n\t}()\n}\n",
-		},
-		{
-			name: "a //nolint on a split line moves above it",
-			in:   "package p\n\nfunc f() *T {\n\treturn &T{A: md5.New()} //nolint:gosec // wire checksums\n}\n",
-			want: "package p\n\nfunc f() *T {\n\t//nolint:gosec // wire checksums\n\treturn &T{\n\t\tA: md5.New(),\n\t}\n}\n",
-		},
-		{
-			name: "a //nolint on a line left alone stays",
-			in:   "package p\n\nfunc f() {\n\tg() //nolint:errcheck // why\n}\n",
-			want: "package p\n\nfunc f() {\n\tg() //nolint:errcheck // why\n}\n",
-		},
-		{
-			name: "empty ones stay",
-			in:   "package p\n\nvar v = T{}\nvar e struct{}\nvar f = func() {}\n",
-			want: "package p\n\nvar v = T{}\nvar e struct{}\nvar f = func() {}\n",
-		},
-		{
-			name: "unfolded code is unchanged, comments and blank lines kept",
-			in:   "package p\n\nvar v = T{\n\t// A is first.\n\tA: 1,\n\n\tB: 2, // B\n}\n",
-			want: "package p\n\nvar v = T{\n\t// A is first.\n\tA: 1,\n\n\tB: 2, // B\n}\n",
-		},
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		t.Fatal(err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
 
-			got, err := Unfold([]byte(tt.in))
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			if string(got) != tt.want {
-				t.Errorf("Unfold:\n%s\nwant:\n%s", got, tt.want)
-			}
-		})
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestEquivalentSeparators(t *testing.T) {
-	t.Parallel()
+func runGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
 
-	src := "package p\n\nvar f = func() int { a := 1; return a }\n"
-	out := "package p\n\nvar f = func() int {\n\ta := 1\n\treturn a\n}\n"
+	cmd := exec.CommandContext(t.Context(), "git", append([]string{
+		"-C",
+		dir,
+	}, args...)...)
+	cmd.Env = append(
+		os.Environ(),
+		"GIT_AUTHOR_NAME=t",
+		"GIT_AUTHOR_EMAIL=t@example.com",
+		"GIT_COMMITTER_NAME=t",
+		"GIT_COMMITTER_EMAIL=t@example.com",
+	)
 
-	if err := Equivalent([]byte(src), []byte(out)); err != nil {
-		t.Errorf("Equivalent = %v, want nil", err)
-	}
-
-	if got, err := Unfold([]byte(src)); err != nil || string(got) != out {
-		t.Errorf("Unfold = %q, %v; want %q", got, err, out)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
 	}
 }
 
-func TestEquivalent(t *testing.T) {
-	t.Parallel()
+func TestRunChangedFromASubdirectory(t *testing.T) {
+	repo := t.TempDir()
 
-	src := "package p\n\n// V is a value.\nvar v = T{A: 1, B: 2} // trailing\n"
+	writeFile(t, filepath.Join(repo, "go.mod"), "module example.com/m\n\ngo 1.26\n")
+	writeFile(t, filepath.Join(repo, "sub", "kept.go"), "package sub\n\nvar kept = 1\n")
+	writeFile(t, filepath.Join(repo, "other", "other.go"), "package other\n\nvar other = 1\n")
+	runGit(t, repo, "init", "-q")
+	runGit(t, repo, "add", ".")
+	runGit(t, repo, "commit", "-q", "-m", "start")
 
-	tests := []struct {
-		name    string
-		out     string
-		wantErr string
-	}{
-		{
-			name: "unfolded",
-			out:  "package p\n\n// V is a value.\nvar v = T{\n\tA: 1,\n\tB: 2,\n} // trailing\n",
-		},
-		{
-			name: "statement separators became line breaks",
-			out:  "package p\n\n// V is a value.\nvar v = T{A: 1, B: 2} // trailing\n",
-		},
-		{
-			name:    "a comment lost",
-			out:     "package p\n\nvar v = T{\n\tA: 1,\n\tB: 2,\n} // trailing\n",
-			wantErr: "comments differ",
-		},
-		{
-			name:    "a comment changed",
-			out:     "package p\n\n// V is a value!\nvar v = T{\n\tA: 1,\n\tB: 2,\n} // trailing\n",
-			wantErr: "comments differ",
-		},
-		{
-			name:    "a value changed",
-			out:     "package p\n\n// V is a value.\nvar v = T{\n\tA: 1,\n\tB: 3,\n} // trailing\n",
-			wantErr: "code differs",
-		},
-		{
-			name:    "an element lost",
-			out:     "package p\n\n// V is a value.\nvar v = T{\n\tA: 1,\n} // trailing\n",
-			wantErr: "code differs",
-		},
-		{
-			name:    "a comma that is not layout",
-			out:     "package p\n\n// V is a value.\nvar v = T{A: 1 B: 2} // trailing\n",
-			wantErr: "code differs",
-		},
+	writeFile(t, filepath.Join(repo, ".unfold.yml"), "format: gofumpt\nexclude:\n  - \"**/skipped.go\"\n")
+	writeFile(t, filepath.Join(repo, "sub", "kept.go"), "package sub\n\nvar kept = []int{1, 2}\n\nconst mode = 0755\n")
+	writeFile(t, filepath.Join(repo, "sub", "added.go"), "package sub\n\nvar added = map[string]int{\"a\": 1}\n")
+	writeFile(t, filepath.Join(repo, "sub", "skipped.go"), "package sub\n\nvar skipped = []int{1, 2}\n")
+	writeFile(t, filepath.Join(repo, "other", "other.go"), "package other\n\nvar other = []int{1}\n")
+
+	t.Chdir(filepath.Join(repo, "sub"))
+
+	files, err := changedFiles("HEAD")
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
 
-			err := Equivalent([]byte(src), []byte(tt.out))
+	slices.Sort(files)
 
-			switch {
-			case tt.wantErr == "" && err != nil:
-				t.Errorf("Equivalent = %v, want nil", err)
-			case tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)):
-				t.Errorf("Equivalent = %v, want %q", err, tt.wantErr)
-			}
-		})
+	if want := []string{
+		"../other/other.go",
+		"added.go",
+		"kept.go",
+		"skipped.go",
+	}; !slices.Equal(files, want) {
+		t.Fatalf("changedFiles = %q, want %q", files, want)
+	}
+
+	check := options{
+		changed: true,
+		base:    "HEAD",
+	}
+	if code := check.run(); code != 1 {
+		t.Errorf("run without -w = %d, want 1", code)
+	}
+
+	write := check
+	write.write = true
+
+	if code := write.run(); code != 0 {
+		t.Fatalf("run -w = %d, want 0", code)
+	}
+
+	for name, want := range map[string]string{
+		"kept.go":           "package sub\n\nvar kept = []int{\n\t1,\n\t2,\n}\n\nconst mode = 0o755\n",
+		"added.go":          "package sub\n\nvar added = map[string]int{\n\t\"a\": 1,\n}\n",
+		"skipped.go":        "package sub\n\nvar skipped = []int{1, 2}\n",
+		"../other/other.go": "package other\n\nvar other = []int{\n\t1,\n}\n",
+	} {
+		got, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if string(got) != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+
+	if code := check.run(); code != 0 {
+		t.Errorf("run without -w after -w = %d, want 0", code)
 	}
 }

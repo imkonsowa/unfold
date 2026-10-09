@@ -1,6 +1,6 @@
 // Command unfold puts every element of a composite literal (struct, map and
 // slice values), every field of a struct type and every statement of a
-// function literal on its own line.
+// function literal on its own line, then formats the file.
 package main
 
 import (
@@ -9,7 +9,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"go/format"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -17,16 +16,35 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/dave/dst"
-	"github.com/dave/dst/decorator"
+	"github.com/imkonsowa/unfold/config"
+	"github.com/imkonsowa/unfold/formatting"
+	"github.com/imkonsowa/unfold/layout"
 )
 
 var generated = regexp.MustCompile(`(?m)^// Code generated .* DO NOT EDIT\.$`)
 
+type options struct {
+	write         bool
+	changed       bool
+	base          string
+	settingsPath  string
+	formatSetting string
+	args          []string
+}
+
 func main() {
-	write := flag.Bool("w", false, "rewrite the files instead of listing them")
-	changed := flag.Bool("changed", false, "the Go files changed against -base, in the working tree too")
-	base := flag.String("base", "origin/main", "the revision -changed compares with")
+	var o options
+
+	flag.BoolVar(&o.write, "w", false, "rewrite the files instead of listing them")
+	flag.BoolVar(&o.changed, "changed", false, "the Go files changed against -base, in the working tree too")
+	flag.StringVar(&o.base, "base", "", "the revision -changed compares with (default origin/main, or base in "+config.FileName+")")
+	flag.StringVar(&o.settingsPath, "config", "", "the settings file (default the nearest "+config.FileName+" from the current directory up)")
+	flag.StringVar(
+		&o.formatSetting,
+		"format",
+		"",
+		"gofmt, gofumpt, or a command that formats Go from stdin to stdout (default gofmt, or format in "+config.FileName+")",
+	)
 	equivalent := flag.Bool("equivalent", false, "check that the second file is the first with only layout changed")
 
 	flag.Parse()
@@ -35,60 +53,120 @@ func main() {
 		os.Exit(checkEquivalent(flag.Args()))
 	}
 
-	files, err := targets(*changed, *base, flag.Args())
+	o.args = flag.Args()
+
+	os.Exit(o.run())
+}
+
+func (o options) run() int {
+	c, err := o.settings()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "unfold:", err)
-		os.Exit(2)
+		return 2
+	}
+
+	formatter, err := formatting.Parse(c.Format)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "unfold:", err)
+		return 2
+	}
+
+	files, err := targets(o.changed, c.Base, o.args)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "unfold:", err)
+		return 2
 	}
 
 	var pending []string
 
 	for _, name := range files {
-		src, err := os.ReadFile(name) //nolint:gosec // G304: the files asked for
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "unfold:", err)
-			os.Exit(2)
-		}
-
-		if generated.Match(src) {
+		if c.Excludes(name) {
 			continue
 		}
 
-		out, err := Unfold(src)
+		changed, err := rewrite(c.Rules, formatter, name, o.write)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "unfold: %s: %v\n", name, err)
-			os.Exit(2)
+			return 2
 		}
 
-		if bytes.Equal(out, src) {
-			continue
-		}
-
-		pending = append(pending, name)
-
-		if *write {
-			//nolint:gosec // G306: source files are world-readable
-			if err := os.WriteFile(name, out, 0o644); err != nil {
-				fmt.Fprintln(os.Stderr, "unfold:", err)
-				os.Exit(2)
-			}
+		if changed {
+			pending = append(pending, name)
 		}
 	}
 
-	if *write || len(pending) == 0 {
-		return
+	if o.write || len(pending) == 0 {
+		return 0
 	}
 
-	fmt.Fprintln(
-		os.Stderr,
-		"unfold: inline literals, struct types or function literals; run unfold -w on:",
-	)
+	fmt.Fprintln(os.Stderr, "unfold: inlined literals, struct types or function literals, or unformatted code; run unfold -w on:")
 
 	for _, name := range pending {
 		fmt.Fprintln(os.Stderr, "  "+name)
 	}
 
-	os.Exit(1)
+	return 1
+}
+
+func (o options) settings() (config.Config, error) {
+	var (
+		c   config.Config
+		err error
+	)
+
+	if o.settingsPath != "" {
+		c, err = config.Load(o.settingsPath)
+	} else {
+		c, err = config.Find(".")
+	}
+
+	if err != nil {
+		return config.Config{}, err
+	}
+
+	if o.base != "" {
+		c.Base = o.base
+	}
+
+	if o.formatSetting != "" {
+		c.Format = o.formatSetting
+	}
+
+	return c, nil
+}
+
+func rewrite(rules layout.Rules, formatter formatting.Formatter, name string, write bool) (bool, error) {
+	src, err := os.ReadFile(name) //nolint:gosec // G304: the files asked for
+	if err != nil {
+		return false, err
+	}
+
+	if generated.Match(src) {
+		return false, nil
+	}
+
+	out, err := rules.Unfold(src)
+	if err != nil {
+		return false, err
+	}
+
+	out, err = formatter.Format(name, out)
+	if err != nil {
+		return false, err
+	}
+
+	if bytes.Equal(out, src) {
+		return false, nil
+	}
+
+	if write {
+		//nolint:gosec // G306: source files are world-readable
+		if err := os.WriteFile(name, out, 0o644); err != nil {
+			return false, err
+		}
+	}
+
+	return true, nil
 }
 
 func checkEquivalent(args []string) int {
@@ -109,7 +187,7 @@ func checkEquivalent(args []string) int {
 		return 2
 	}
 
-	if err := Equivalent(src, out); err != nil {
+	if err := layout.Equivalent(src, out); err != nil {
 		fmt.Fprintf(os.Stderr, "unfold: %s: %v\n", args[1], err)
 		return 1
 	}
@@ -160,12 +238,24 @@ func skipDir(name string) bool {
 }
 
 func changedFiles(base string) ([]string, error) {
-	diff, err := git("diff", "--name-only", "--diff-filter=ACMR", base, "--", "*.go")
+	top, err := git("rev-parse", "--show-toplevel")
 	if err != nil {
 		return nil, err
 	}
 
-	untracked, err := git("ls-files", "--others", "--exclude-standard", "--", "*.go")
+	top = strings.TrimSpace(top)
+
+	diff, err := git("-C", top, "diff", "--name-only", "--diff-filter=ACMR", base, "--", "*.go")
+	if err != nil {
+		return nil, err
+	}
+
+	untracked, err := git("-C", top, "ls-files", "--others", "--exclude-standard", "--", "*.go")
+	if err != nil {
+		return nil, err
+	}
+
+	cwd, err := os.Getwd()
 	if err != nil {
 		return nil, err
 	}
@@ -173,9 +263,16 @@ func changedFiles(base string) ([]string, error) {
 	var files []string
 
 	for name := range strings.FieldsSeq(diff + "\n" + untracked) {
-		if !strings.Contains("/"+name, "/node_modules/") {
-			files = append(files, name)
+		if strings.Contains("/"+name, "/node_modules/") {
+			continue
 		}
+
+		rel, err := filepath.Rel(cwd, filepath.Join(top, name))
+		if err != nil {
+			return nil, err
+		}
+
+		files = append(files, rel)
 	}
 
 	return files, nil
@@ -193,146 +290,4 @@ func git(args ...string) (string, error) {
 	}
 
 	return string(out), nil
-}
-
-// Unfold returns src with every non-empty composite literal, struct type
-// and function literal spread one element, field or statement per line.
-func Unfold(src []byte) ([]byte, error) {
-	f, err := decorator.Parse(src)
-	if err != nil {
-		return nil, err
-	}
-
-	dst.Inspect(f, func(n dst.Node) bool {
-		switch n.(type) {
-		case dst.Stmt, *dst.GenDecl:
-			if _, block := n.(*dst.BlockStmt); !block && folded(n) {
-				hoistNolint(n)
-			}
-		}
-
-		return true
-	})
-
-	dst.Inspect(f, func(n dst.Node) bool {
-		switch x := n.(type) {
-		case *dst.CompositeLit:
-			spread(len(x.Elts), func(i int) *dst.NodeDecs {
-				return x.Elts[i].Decorations()
-			})
-		case *dst.StructType:
-			spread(len(x.Fields.List), func(i int) *dst.NodeDecs {
-				return &x.Fields.List[i].Decs.NodeDecs
-			})
-		case *dst.FuncLit:
-			spread(len(x.Body.List), func(i int) *dst.NodeDecs {
-				return x.Body.List[i].Decorations()
-			})
-		}
-
-		return true
-	})
-
-	var buf bytes.Buffer
-	if err := decorator.Fprint(&buf, f); err != nil {
-		return nil, err
-	}
-
-	out, err := format.Source(buf.Bytes())
-	if err != nil {
-		return nil, err
-	}
-
-	if err := Equivalent(src, out); err != nil {
-		return nil, fmt.Errorf("rewrite refused, it would change more than layout: %w", err)
-	}
-
-	return out, nil
-}
-
-func within(n dst.Node, visit func(dst.Node)) {
-	dst.Inspect(n, func(c dst.Node) bool {
-		if _, block := c.(*dst.BlockStmt); block && c != n {
-			return false
-		}
-
-		if c != nil {
-			visit(c)
-		}
-
-		return true
-	})
-}
-
-func folded(n dst.Node) bool {
-	found := false
-
-	within(n, func(c dst.Node) {
-		switch x := c.(type) {
-		case *dst.CompositeLit:
-			found = found || inline(len(x.Elts), func(i int) *dst.NodeDecs {
-				return x.Elts[i].Decorations()
-			})
-		case *dst.StructType:
-			found = found || inline(len(x.Fields.List), func(i int) *dst.NodeDecs {
-				return &x.Fields.List[i].Decs.NodeDecs
-			})
-		case *dst.FuncLit:
-			found = found || inline(len(x.Body.List), func(i int) *dst.NodeDecs {
-				return x.Body.List[i].Decorations()
-			})
-		}
-	})
-
-	return found
-}
-
-func inline(n int, decs func(int) *dst.NodeDecs) bool {
-	for i := range n {
-		if decs(i).Before == dst.None {
-			return true
-		}
-	}
-
-	return n > 0 && decs(n-1).After == dst.None
-}
-
-func hoistNolint(n dst.Node) {
-	var hoisted []string
-
-	within(n, func(c dst.Node) {
-		d := c.Decorations()
-
-		var kept dst.Decorations
-
-		for _, comment := range d.End {
-			if strings.HasPrefix(comment, "//nolint") {
-				hoisted = append(hoisted, comment)
-			} else {
-				kept = append(kept, comment)
-			}
-		}
-
-		d.End = kept
-	})
-
-	if len(hoisted) > 0 {
-		d := n.Decorations()
-		d.Start = append(d.Start, hoisted...)
-		d.Before = dst.NewLine
-	}
-}
-
-func spread(n int, decs func(int) *dst.NodeDecs) {
-	for i := range n {
-		if d := decs(i); d.Before == dst.None {
-			d.Before = dst.NewLine
-		}
-	}
-
-	if n > 0 {
-		if d := decs(n - 1); d.After == dst.None {
-			d.After = dst.NewLine
-		}
-	}
 }

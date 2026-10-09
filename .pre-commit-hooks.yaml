@@ -1,0 +1,7 @@
+- id: unfold
+  name: unfold
+  description: Put every composite literal element, struct field and function literal statement on its own line.
+  entry: unfold -w
+  language: golang
+  types:
+    - go

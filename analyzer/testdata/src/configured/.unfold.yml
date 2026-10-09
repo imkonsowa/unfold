@@ -1,0 +1,5 @@
+composite-literals: true
+struct-types: false
+min-elements: 2
+exclude:
+  - skipped.go

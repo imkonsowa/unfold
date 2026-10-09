@@ -1,0 +1,31 @@
+package inlined
+
+type point struct {
+	X, Y int
+} // want `struct type is inlined: put each field on its own line`
+
+var origin = point{
+	X: 0,
+	Y: 0,
+} // want `composite literal is inlined: put each element on its own line`
+
+var path = []point{
+	{
+		X: 1,
+		Y: 2,
+	},
+} // want `composite literal is inlined` `composite literal is inlined`
+
+var next = func(p point) point {
+	return point{ // want `function literal is inlined: put each statement on its own line`
+		X: p.X + 1,
+		Y: p.Y,
+	}
+}
+
+var unfolded = point{
+	X: 3,
+	Y: 4,
+}
+
+var empty = point{}
